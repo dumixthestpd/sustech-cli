@@ -96,6 +96,22 @@ import {
   searchOnlineContacts,
   searchOnlineTalks,
 } from "./online/index.js";
+import {
+  formatExtractedText,
+  formatSyllabusDownloads,
+  formatSyllabusStatus,
+  formatSyllabusUrls,
+  formatTrainingProgramUrls,
+  formatUrlList,
+  MirrorClient,
+  MirrorError,
+  normalizeCourseCode,
+  type MirrorFetchOptions,
+  type MirrorSyllabus,
+} from "./mirror/index.js";
+import { mkdir, stat, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { dirname, join, resolve as resolvePathMirror } from "node:path";
 import { searchResources, type ResourceCategory } from "./resources/catalog.js";
 import { formatResources } from "./resources/text.js";
 import {
@@ -353,6 +369,10 @@ Usage:
   sustech online talks get ID
   sustech online contact search QUERY [--limit N]
   sustech online contact get ID
+  sustech mirror syllabus url CODE...           — print mirror URL(s); no network
+  sustech mirror syllabus exists CODE...         — HEAD-probe the mirror; exit 0 iff found
+  sustech mirror syllabus get CODE... [--destination DIR] [--overwrite]   — download PDF(s)
+  sustech mirror syllabus text CODE...          — download + extract plain text from each PDF
   sustech context [--date YYYY-MM-DD] [--calendar-level undergraduate|graduate] [--level terse|normal|verbose] [--live] [--credentials-file PATH]
   sustech profile show [--profile NAME] [--credentials-file PATH]
   sustech profile export --destination PATH [--overwrite] [--profile NAME] [--credentials-file PATH]
@@ -692,6 +712,10 @@ async function main(argv: string[]): Promise<void> {
   }
   if (group === "online") {
     await runOnline(parsed.positionals, values, output);
+    return;
+  }
+  if (group === "mirror") {
+    await runMirror(parsed.positionals, values, output);
     return;
   }
   if (group === "context") {
@@ -2392,6 +2416,178 @@ async function runOnline(
 
   throw usageError(`Unknown command: ${positionals.join(" ")}`);
 }
+
+  // -- mirror -----------------------------------------------------------------
+  //
+  // Ported from sustech_survival (Python) by dumixthestpd.
+  // Source: https://github.com/dumixthestpd/sustech_survival/blob/main/src/sustech_survival/mirror/
+
+  async function runMirror(
+    positionals: string[],
+    values: Values,
+    output: ReturnType<typeof resolveOutputOptions>,
+  ): Promise<void> {
+    const section = positionals[1];
+    if (section !== "syllabus") {
+      throw usageError(
+        `Unknown mirror subcommand. Currently only 'sustech mirror syllabus ...' is supported. ` +
+          `Source of truth: https://github.com/dumixthestpd/sustech_survival`,
+      );
+    }
+    const operation = positionals[2];
+
+    if (operation === "url") {
+      const codes = positionals.slice(3);
+      if (codes.length === 0) throw usageError("At least one course code is required.");
+      const client = new MirrorClient();
+      writeSuccess(
+        {
+          command: "mirror syllabus url",
+          data: { codes: codes.map(normalizeCourseCode), urls: codes.map((c) => client.syllabusUrl(c)) },
+          text: formatSyllabusUrls(codes, (c) => client.syllabusUrl(c)),
+          meta: { source: "SUSTech CRA mirror", license: "CC-BY-SA-4.0" },
+        },
+        output,
+      );
+      return;
+    }
+
+    if (operation === "exists") {
+      const codes = positionals.slice(3);
+      if (codes.length === 0) throw usageError("At least one course code is required.");
+      const client = new MirrorClient();
+      const items: Array<{ code: string; exists: boolean; url: string }> = [];
+      for (const code of codes) {
+        const normalized = normalizeCourseCode(code);
+        try {
+          const exists = await client.exists(normalized);
+          items.push({ code: normalized, exists, url: client.syllabusUrl(normalized) });
+        } catch (err) {
+          items.push({ code: normalized, exists: false, url: client.syllabusUrl(normalized) });
+          if (output.mode === "text") {
+            process.stderr.write(`  warning ${normalized}: ${err instanceof Error ? err.message : String(err)}\n`);
+          }
+        }
+      }
+      const text = items
+        .map((i) => formatSyllabusStatus(i.code, i.exists, i.url))
+        .join("\n");
+      writeSuccess(
+        {
+          command: "mirror syllabus exists",
+          data: { items, total: items.length, present: items.filter((i) => i.exists).length },
+          text,
+          items,
+          summary: { total: items.length, present: items.filter((i) => i.exists).length },
+          meta: { source: "SUSTech CRA mirror" },
+        },
+        output,
+      );
+      if (items.some((i) => !i.exists)) process.exitCode = 1;
+      return;
+    }
+
+    if (operation === "get") {
+      const codes = positionals.slice(3);
+      if (codes.length === 0) throw usageError("At least one course code is required.");
+      const outDirRaw = values.destination;
+      const outDir = outDirRaw ? resolvePathMirror(outDirRaw) : defaultMirrorDir();
+      await mkdir(outDir, { recursive: true });
+      const overwrite = Boolean(values.overwrite);
+      const client = new MirrorClient();
+      const downloads: Array<{ code: string; path: string }> = [];
+      const failures: Array<{ code: string; reason: string }> = [];
+      for (const code of codes) {
+        const normalized = normalizeCourseCode(code);
+        const target = join(outDir, `${normalized}.pdf`);
+        if (!overwrite && (await fileExists(target))) {
+          failures.push({ code: normalized, reason: `exists: ${target} (pass --overwrite)` });
+          continue;
+        }
+        try {
+          const bytes = await client.fetchPdf(normalized);
+          await writeFile(target, bytes);
+          downloads.push({ code: normalized, path: target });
+        } catch (err) {
+          const reason = err instanceof MirrorError
+            ? `${err.code}: ${err.message}`
+            : err instanceof Error ? err.message : String(err);
+          failures.push({ code: normalized, reason });
+        }
+      }
+      writeSuccess(
+        {
+          command: "mirror syllabus get",
+          data: { downloads, failures, outDir },
+          text: formatSyllabusDownloads(downloads) + (failures.length ? `\nFailures:\n` + failures.map((f) => `  fail ${f.code}: ${f.reason}`).join("\n") : ""),
+          items: downloads,
+          summary: { downloaded: downloads.length, failed: failures.length, outDir },
+          meta: { source: "SUSTech CRA mirror" },
+        },
+        output,
+      );
+      if (failures.length > 0) process.exitCode = 1;
+      return;
+    }
+
+    if (operation === "text") {
+      const codes = positionals.slice(3);
+      if (codes.length === 0) throw usageError("At least one course code is required.");
+      const client = new MirrorClient();
+      const items: Array<{ code: string; url: string; text: string; error?: string }> = [];
+      for (const code of codes) {
+        const normalized = normalizeCourseCode(code);
+        try {
+          const bytes = await client.fetchPdf(normalized);
+          const text = await client.extractText(bytes);
+          items.push({ code: normalized, url: client.syllabusUrl(normalized), text });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          items.push({ code: normalized, url: client.syllabusUrl(normalized), text: "", error: msg });
+        }
+      }
+      const text = items.map((i) => {
+        if (i.error) return `fail ${i.code}: ${i.error}`;
+        return formatExtractedText(i.code, i.text);
+      }).join("\n\n");
+      writeSuccess(
+        {
+          command: "mirror syllabus text",
+          data: { items: items.map((i) => ({ code: i.code, url: i.url, text: i.text, ...(i.error ? { error: i.error } : {}) })) },
+          text,
+          items,
+          summary: { total: items.length, ok: items.filter((i) => !i.error).length },
+          meta: { source: "SUSTech CRA mirror", note: "PDF text extraction requires the optional 'pdf-parse' dependency." },
+        },
+        output,
+      );
+      if (items.some((i) => i.error)) process.exitCode = 1;
+      return;
+    }
+
+    throw usageError(
+      `Unknown mirror syllabus subcommand. Try one of: url, exists, get, text.`,
+    );
+  }
+
+  // -- mirror helpers (used by runMirror above) ---------------------------
+
+  function defaultMirrorDir(): string {
+    // Mirror to ~/.sustech_survival/downloads/syllabus/ by default;
+    // honors $SUSTECH_HOME if the user has set it. Mirrors the
+    // Python port at sustech_survival._cache.config_root().
+    const home = process.env.SUSTECH_HOME ?? join(homedir(), ".sustech_survival");
+    return join(home, "downloads", "syllabus");
+  }
+
+  async function fileExists(path: string): Promise<boolean> {
+    try {
+      await stat(path);
+      return true;
+    } catch {
+      return false;
+    }
+  }
 
 function onlineSection(value?: string): "talks" | "contact" | undefined {
   if (value === undefined) return undefined;
