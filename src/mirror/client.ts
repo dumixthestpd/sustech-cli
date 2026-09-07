@@ -41,7 +41,37 @@ export const PROGRAM_PREFIX = "/courses/本科人才培养方案";
 /** Path to the campus-map PDFs. */
 export const CAMPUS_MAP_PREFIX = "/site/sustech-online/documents/campus-map";
 
-const DEFAULT_DOWNLOAD_TIMEOUT_MS = 20_000;
+/** Known handbook documents on the mirror (add more as we discover them). */
+export const HANDBOOK_KINDS: Record<string, string> = {
+  "freshman-2022": "/site/sustech-online/documents/freshman-handbook/2022.pdf",
+};
+
+/**
+ * Training-program year entries probed by `program years`. Most years are
+ * subdirectories; 2025+ ship as a single per-year compendium PDF. 2018 has
+ * two subdirs (apply-at-end-of-year-1 vs year-2).
+ */
+export const TRAINING_PROGRAM_YEAR_CANDIDATES: ReadonlyArray<{ label: string; path: string }> = [
+  { label: "2018级本科人才培养方案（适用于第一学年结束时，申请进入专业）", path: "2018级本科人才培养方案（适用于第一学年结束时，申请进入专业）/" },
+  { label: "2018级本科人才培养方案（适用于第二学年结束时，申请进入专业）", path: "2018级本科人才培养方案（适用于第二学年结束时，申请进入专业）/" },
+  { label: "2019级本科人才培养方案", path: "2019级本科人才培养方案/" },
+  { label: "2020级本科人才培养方案", path: "2020级本科人才培养方案/" },
+  { label: "2021级本科人才培养方案", path: "2021级本科人才培养方案/" },
+  { label: "2022级本科人才培养方案", path: "2022级本科人才培养方案/" },
+  { label: "2023级本科人才培养方案", path: "2023级本科人才培养方案/" },
+  { label: "2024级本科人才培养方案", path: "2024级本科人才培养方案/" },
+  { label: "2025级本科人才培养方案", path: "2025级本科人才培养方案.pdf" },
+  { label: "2026级本科人才培养方案", path: "2026级本科人才培养方案.pdf" },
+];
+
+/** Normalize a training-program year: "2024" and "2024级" → "2024级". */
+export function normalizeTrainingYear(raw: string): string {
+  const trimmed = (raw ?? "").trim();
+  if (!trimmed || trimmed.endsWith("级")) return trimmed;
+  return `${trimmed}级`;
+}
+
+const DEFAULT_DOWNLOAD_TIMEOUT_MS = 60_000;
 const DEFAULT_PROBE_TIMEOUT_MS = 10_000;
 
 /** Normalize a course code: strip whitespace, uppercase. */
@@ -192,7 +222,7 @@ export class MirrorClient {
 
   // -- Training programs -----------------------------------------------------
 
-  /** Download a per-year training-program PDF. */
+  /** Download a per-year training-program PDF. Throws on 404 / transport error. */
   async fetchTrainingProgram(year: string, options: MirrorFetchOptions = {}): Promise<Uint8Array> {
     const url = this.trainingProgramUrl(year);
     const timeoutMs = options.timeoutMs ?? this.defaultDownloadTimeoutMs;
@@ -217,6 +247,153 @@ export class MirrorClient {
         url,
         response.status,
       );
+    }
+    return new Uint8Array(await response.arrayBuffer());
+  }
+
+  // -- Directory listings, handbook, campus map ------------------------------
+
+  /** True iff a path under the mirror root exists (HEAD probe). */
+  async existsPath(path: string, options: MirrorFetchOptions = {}): Promise<boolean> {
+    const url = `${MIRROR_BASE}/${path.replace(/^\/+/, "")}`;
+    const timeoutMs = options.timeoutMs ?? this.defaultProbeTimeoutMs;
+    const init: RequestInit = {
+      method: "HEAD",
+      signal: AbortSignal.timeout(timeoutMs),
+      redirect: "follow",
+    };
+    if (this.userAgent) init.headers = { "user-agent": this.userAgent };
+    try {
+      const response = await fetch(url, init);
+      return response.ok;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Fetch the raw HTML of a mirror autoindex page (Nginx directory index).
+   * Throws on 403 (listing disabled) / transport error.
+   */
+  async fetchIndexHtml(subpath: string, options: MirrorFetchOptions = {}): Promise<string> {
+    const url = `${MIRROR_BASE}/${subpath.replace(/^\/+/, "")}/`;
+    const timeoutMs = options.timeoutMs ?? this.defaultProbeTimeoutMs;
+    const init: RequestInit = {
+      signal: AbortSignal.timeout(timeoutMs),
+      redirect: "follow",
+    };
+    if (this.userAgent) init.headers = { "user-agent": this.userAgent };
+    let response: Response;
+    try {
+      response = await fetch(url, init);
+    } catch (err) {
+      throw new MirrorError(
+        "network",
+        `GET ${url} failed: ${err instanceof Error ? err.message : String(err)}`,
+        url,
+      );
+    }
+    if (response.status === 403) {
+      throw new MirrorError("forbidden", `directory listing disabled for ${url} (403)`, url, 403);
+    }
+    if (response.status === 404) {
+      throw new MirrorError("not_found", `no such directory on the mirror: ${url}`, url, 404);
+    }
+    if (!response.ok) {
+      throw new MirrorError("upstream", `mirror returned ${response.status} for ${url}`, url, response.status);
+    }
+    return await response.text();
+  }
+
+  /**
+   * Parse a mirror autoindex HTML page into entries. Parent links ("../")
+   * and query-string links are dropped.
+   */
+  parseIndexEntries(html: string): Array<{ href: string; name: string; directory: boolean }> {
+    const entries: Array<{ href: string; name: string; directory: boolean }> = [];
+    const anchorRe = /<a\s+href="([^"]+)"[^>]*>([^<]+)<\/a>/g;
+    let match: RegExpExecArray | null;
+    while ((match = anchorRe.exec(html)) !== null) {
+      const href = match[1];
+      if (href === "../" || href === "/" || href === "" || href.startsWith("?")) continue;
+      entries.push({
+        href,
+        name: match[2],
+        directory: href.endsWith("/"),
+      });
+    }
+    return entries;
+  }
+
+  /** Download a known handbook PDF (see HANDBOOK_KINDS). */
+  async fetchHandbook(kind: string, options: MirrorFetchOptions = {}): Promise<Uint8Array> {
+    const path = HANDBOOK_KINDS[kind];
+    if (!path) {
+      throw new MirrorError(
+        "not_found",
+        `unknown handbook kind: ${JSON.stringify(kind)}. Known: ${Object.keys(HANDBOOK_KINDS).join(", ")}`,
+        `${MIRROR_BASE}${CAMPUS_MAP_PREFIX}`,
+      );
+    }
+    return this.fetchFile(path, options);
+  }
+
+  /**
+   * Download the latest campus-map PDF. The exact filename changes per
+   * release (v4-1, v4-2, ...), so the directory index is probed for PDFs;
+   * falls back to the known v4-1 name.
+   */
+  async fetchCampusMap(options: MirrorFetchOptions = {}): Promise<{ bytes: Uint8Array; path: string }> {
+    const candidates: string[] = [];
+    try {
+      const html = await this.fetchIndexHtml(CAMPUS_MAP_PREFIX.replace(/^\//, ""), options);
+      for (const entry of this.parseIndexEntries(html)) {
+        if (/\.pdf$/i.test(entry.href)) candidates.push(entry.href);
+      }
+    } catch {
+      // Index probing is best-effort; fall through to the hardcoded fallback.
+    }
+    if (candidates.length === 0) {
+      candidates.push("site/sustech-online/documents/campus-map/南方科技大学校园地图-v4-1.pdf");
+    }
+    let lastError: unknown;
+    for (const path of candidates) {
+      try {
+        const bytes = await this.fetchFile(path, options);
+        return { bytes, path };
+      } catch (err) {
+        lastError = err;
+      }
+    }
+    throw lastError instanceof MirrorError
+      ? lastError
+      : new MirrorError("upstream", `could not fetch any campus map (last error: ${String(lastError)})`, `${MIRROR_BASE}${CAMPUS_MAP_PREFIX}`);
+  }
+
+  /** GET any file under the mirror root and return its bytes. */
+  async fetchFile(path: string, options: MirrorFetchOptions = {}): Promise<Uint8Array> {
+    const url = path.startsWith("http") ? path : `${MIRROR_BASE}/${path.replace(/^\/+/, "")}`;
+    const timeoutMs = options.timeoutMs ?? this.defaultDownloadTimeoutMs;
+    const init: RequestInit = {
+      signal: AbortSignal.timeout(timeoutMs),
+      redirect: "follow",
+    };
+    if (this.userAgent) init.headers = { "user-agent": this.userAgent };
+    let response: Response;
+    try {
+      response = await fetch(url, init);
+    } catch (err) {
+      throw new MirrorError(
+        "network",
+        `GET ${url} failed: ${err instanceof Error ? err.message : String(err)}`,
+        url,
+      );
+    }
+    if (response.status === 404) {
+      throw new MirrorError("not_found", `not found on the mirror (URL: ${url})`, url, 404);
+    }
+    if (!response.ok) {
+      throw new MirrorError("upstream", `mirror returned ${response.status} for ${url}`, url, response.status);
     }
     return new Uint8Array(await response.arrayBuffer());
   }

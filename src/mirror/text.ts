@@ -59,6 +59,51 @@ export function formatUrlList(rows: readonly string[]): string {
   return rows.join("\n");
 }
 
+/** Format the entries of a mirror directory listing (`mirror list`). */
+export function formatIndexEntries(entries: ReadonlyArray<{ href: string; name: string; directory: boolean }>): string {
+  if (entries.length === 0) return "(empty directory listing)";
+  return [
+    `Mirror directory entries · ${entries.length}`,
+    ...entries.map((e) => `  ${e.directory ? "📁" : "📄"} ${e.name}  (${e.href})`),
+  ].join("\n");
+}
+
+/** Format the available training-program years (`mirror program years`). */
+export function formatTrainingProgramYears(years: readonly string[]): string {
+  if (years.length === 0) return "No training-plan years found (mirror may be down).";
+  return [
+    `Available training-plan years · ${years.length}`,
+    ...years.map((y) => `  ${y}`),
+  ].join("\n");
+}
+
+/** Format the TIS-backed course info (`mirror course`, text mode). */
+export function formatMirrorCourse(info: {
+  code: string;
+  name: string;
+  nameEn?: string;
+  department?: string;
+  credits?: number | null;
+  courseType?: string;
+  courseCategory?: string;
+  semester?: string;
+  score?: string;
+  rank?: string;
+  classSize?: string;
+  source: string;
+}): string {
+  const lines = [`Course: ${info.code} ${info.name}`];
+  if (info.nameEn) lines.push(`  English: ${info.nameEn}`);
+  if (info.department) lines.push(`  Department: ${info.department}`);
+  if (info.credits !== null && info.credits !== undefined) lines.push(`  Credits: ${info.credits}`);
+  if (info.courseType) lines.push(`  Type: ${info.courseType}`);
+  if (info.courseCategory) lines.push(`  Category: ${info.courseCategory}`);
+  if (info.semester) lines.push(`  Semester: ${info.semester}`);
+  if (info.score) lines.push(`  Score: ${info.score} (rank ${info.rank ?? "?"}/${info.classSize ?? "?"})`);
+  lines.push(`  Source: ${info.source}`);
+  return lines.join("\n");
+}
+
 /** Format the extracted PDF text. Long output is truncated for terminal use. */
 export function formatExtractedText(code: string, text: string, maxChars = 4000): string {
   const head = text.length > maxChars ? text.slice(0, maxChars) + "\n…(truncated)…" : text;

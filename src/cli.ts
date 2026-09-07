@@ -98,14 +98,22 @@ import {
 } from "./online/index.js";
 import {
   formatExtractedText,
+  formatIndexEntries,
+  formatMirrorCourse,
   formatSyllabusDownloads,
   formatSyllabusStatus,
   formatSyllabusUrls,
   formatTrainingProgramUrls,
+  formatTrainingProgramYears,
   formatUrlList,
+  HANDBOOK_KINDS,
+  MIRROR_BASE,
   MirrorClient,
   MirrorError,
   normalizeCourseCode,
+  normalizeTrainingYear,
+  PROGRAM_PREFIX,
+  TRAINING_PROGRAM_YEAR_CANDIDATES,
   type MirrorFetchOptions,
   type MirrorSyllabus,
 } from "./mirror/index.js";
@@ -336,7 +344,7 @@ import {
   formatWsDetail,
   formatWsPrograms,
 } from "./services/text.js";
-import type { ExamRecord, PersonalScheduleEntry } from "./tis/types.js";
+import type { Course, ExamRecord, GradeRecord, PersonalScheduleEntry } from "./tis/types.js";
 
 const VERSION = CLI_VERSION;
 
@@ -373,6 +381,13 @@ Usage:
   sustech mirror syllabus exists CODE...         — HEAD-probe the mirror; exit 0 iff found
   sustech mirror syllabus get CODE... [--destination DIR] [--overwrite]   — download PDF(s)
   sustech mirror syllabus text CODE...          — download + extract plain text from each PDF
+  sustech mirror program years                  — list available training-plan years (本科人才培养方案)
+  sustech mirror program url YEAR...            — print training-plan URL(s); no network
+  sustech mirror program get YEAR... [--destination DIR] [--overwrite]    — download training-plan PDF(s)
+  sustech mirror map get [--destination DIR]    — download the latest campus-map PDF
+  sustech mirror handbook get KIND [--destination DIR]  — download a known handbook PDF (e.g. freshman-2022)
+  sustech mirror list SUBPATH                   — best-effort directory listing for a mirror subpath
+  sustech mirror course CODE                    — TIS-backed machine-readable course info (no PDF parsing)
   sustech context [--date YYYY-MM-DD] [--calendar-level undergraduate|graduate] [--level terse|normal|verbose] [--live] [--credentials-file PATH]
   sustech profile show [--profile NAME] [--credentials-file PATH]
   sustech profile export --destination PATH [--overwrite] [--profile NAME] [--credentials-file PATH]
@@ -2428,15 +2443,15 @@ async function runOnline(
     output: ReturnType<typeof resolveOutputOptions>,
   ): Promise<void> {
     const section = positionals[1];
-    if (section !== "syllabus") {
+    if (section !== "syllabus" && section !== "program" && section !== "map" && section !== "handbook" && section !== "list" && section !== "course") {
       throw usageError(
-        `Unknown mirror subcommand. Currently only 'sustech mirror syllabus ...' is supported. ` +
+        `Unknown mirror subcommand. Supported: syllabus, program, map, handbook, list, course. ` +
           `Source of truth: https://github.com/dumixthestpd/sustech_survival`,
       );
     }
     const operation = positionals[2];
 
-    if (operation === "url") {
+    if (section === "syllabus" && operation === "url") {
       const codes = positionals.slice(3);
       if (codes.length === 0) throw usageError("At least one course code is required.");
       const client = new MirrorClient();
@@ -2452,7 +2467,7 @@ async function runOnline(
       return;
     }
 
-    if (operation === "exists") {
+    if (section === "syllabus" && operation === "exists") {
       const codes = positionals.slice(3);
       if (codes.length === 0) throw usageError("At least one course code is required.");
       const client = new MirrorClient();
@@ -2487,7 +2502,7 @@ async function runOnline(
       return;
     }
 
-    if (operation === "get") {
+    if (section === "syllabus" && operation === "get") {
       const codes = positionals.slice(3);
       if (codes.length === 0) throw usageError("At least one course code is required.");
       const outDirRaw = values.destination;
@@ -2530,7 +2545,7 @@ async function runOnline(
       return;
     }
 
-    if (operation === "text") {
+    if (section === "syllabus" && operation === "text") {
       const codes = positionals.slice(3);
       if (codes.length === 0) throw usageError("At least one course code is required.");
       const client = new MirrorClient();
@@ -2565,6 +2580,297 @@ async function runOnline(
       return;
     }
 
+    // -- program (本科人才培养方案) ------------------------------------------
+
+    if (section === "program") {
+      if (operation === "years") {
+        const client = new MirrorClient();
+        const found: string[] = [];
+        for (const candidate of TRAINING_PROGRAM_YEAR_CANDIDATES) {
+          try {
+            const exists = await client.existsPath(`${PROGRAM_PREFIX}/${candidate.path}`);
+            if (exists) found.push(candidate.label);
+          } catch {
+            // probe failure = not counted
+          }
+        }
+        writeSuccess(
+          {
+            command: "mirror program years",
+            data: { years: found },
+            text: formatTrainingProgramYears(found),
+            summary: { total: found.length },
+            meta: { source: "SUSTech CRA mirror" },
+          },
+          output,
+        );
+        if (found.length === 0) process.exitCode = 1;
+        return;
+      }
+      if (operation === "url") {
+        const years = positionals.slice(3);
+        if (years.length === 0) throw usageError("At least one year is required (e.g. 2024 or 2024级).");
+        const client = new MirrorClient();
+        const normalized = years.map(normalizeTrainingYear);
+        writeSuccess(
+          {
+            command: "mirror program url",
+            data: { years: normalized, urls: normalized.map((y) => client.trainingProgramUrl(y)) },
+            text: formatTrainingProgramUrls(normalized.map((y) => ({ year: y, pdfUrl: client.trainingProgramUrl(y) }))),
+            meta: { source: "SUSTech CRA mirror" },
+          },
+          output,
+        );
+        return;
+      }
+      if (operation === "get") {
+        const years = positionals.slice(3);
+        if (years.length === 0) throw usageError("At least one year is required (e.g. 2024 or 2024级; known range 2019–2025级).");
+        const outDirRaw = values.destination;
+        const outDir = outDirRaw ? resolvePathMirror(outDirRaw) : join(defaultMirrorRoot(), "program");
+        await mkdir(outDir, { recursive: true });
+        const overwrite = Boolean(values.overwrite);
+        const client = new MirrorClient();
+        const downloads: Array<{ year: string; path: string }> = [];
+        const failures: Array<{ year: string; reason: string }> = [];
+        for (const year of years) {
+          const normalized = normalizeTrainingYear(year);
+          const target = join(outDir, `${normalized}本科人才培养方案.pdf`);
+          if (!overwrite && (await fileExists(target))) {
+            failures.push({ year: normalized, reason: `exists: ${target} (pass --overwrite)` });
+            continue;
+          }
+          // 2019–2024 ship as per-major PDF *directories* (no single
+          // compendium); 2025+ ship as one compendium PDF. Try the single
+          // PDF first, then the 通识 (general-education) compendium that
+          // anchors each year directory.
+          let bytes: Uint8Array | undefined;
+          let lastError: unknown;
+          for (const candidate of [
+            `${normalized}本科人才培养方案.pdf`,
+            `${normalized}本科人才培养方案/00-${normalized}通识培养方案.pdf`,
+          ]) {
+            try {
+              bytes = await client.fetchFile(`${PROGRAM_PREFIX}/${candidate}`);
+              break;
+            } catch (err) {
+              lastError = err;
+            }
+          }
+          if (bytes === undefined) {
+            const reason = lastError instanceof MirrorError
+              ? `${lastError.code}: ${lastError.message}`
+              : lastError instanceof Error ? lastError.message : String(lastError);
+            failures.push({ year: normalized, reason: `${reason} (per-major PDFs live in the year directory — open ${MIRROR_BASE}${PROGRAM_PREFIX}/${normalized}本科人才培养方案/ in a browser)` });
+            continue;
+          }
+          await writeFile(target, bytes);
+          downloads.push({ year: normalized, path: target });
+        }
+        writeSuccess(
+          {
+            command: "mirror program get",
+            data: { downloads, failures, outDir },
+            text: formatTrainingProgramUrls(downloads.map((d) => ({ year: d.year, pdfUrl: d.path }))) +
+              (failures.length ? `\nFailures:\n` + failures.map((f) => `  fail ${f.year}: ${f.reason}`).join("\n") : ""),
+            items: downloads,
+            summary: { downloaded: downloads.length, failed: failures.length, outDir },
+            meta: { source: "SUSTech CRA mirror" },
+          } as Parameters<typeof writeSuccess>[0],
+          output,
+        );
+        if (failures.length > 0) process.exitCode = 1;
+        return;
+      }
+      throw usageError(`Unknown mirror program subcommand. Try one of: years, url, get.`);
+    }
+
+    // -- map (campus map) ------------------------------------------------------
+
+    if (section === "map") {
+      if (operation !== "get") {
+        throw usageError(`Unknown mirror map subcommand. Try: get.`);
+      }
+      const outDirRaw = values.destination;
+      const outDir = outDirRaw ? resolvePathMirror(outDirRaw) : join(defaultMirrorRoot(), "map");
+      await mkdir(outDir, { recursive: true });
+      const overwrite = Boolean(values.overwrite);
+      const target = join(outDir, "sustech-campus-map.pdf");
+      if (!overwrite && (await fileExists(target))) {
+        writeSuccess(
+          {
+            command: "mirror map get",
+            data: { path: target, skipped: true, reason: "already exists (pass --overwrite)" },
+            text: `  ⏭  ${target} already exists (pass --overwrite)`,
+            summary: { path: target, downloaded: false },
+            meta: { source: "SUSTech CRA mirror" },
+          },
+          output,
+        );
+        return;
+      }
+      const client = new MirrorClient();
+      try {
+        const { bytes, path: fetchedPath } = await client.fetchCampusMap();
+        await writeFile(target, bytes);
+        writeSuccess(
+          {
+            command: "mirror map get",
+            data: { path: target, mirrorPath: fetchedPath, bytes: bytes.byteLength },
+            text: `  ✅ ${target} (${bytes.byteLength.toLocaleString()} bytes from ${fetchedPath})`,
+            summary: { path: target, downloaded: true, bytes: bytes.byteLength },
+            meta: { source: "SUSTech CRA mirror" },
+          },
+          output,
+        );
+      } catch (err) {
+        throw err instanceof MirrorError ? err : new MirrorError(
+          "upstream",
+          `could not fetch campus map: ${err instanceof Error ? err.message : String(err)}`,
+          "(campus map)",
+        );
+      }
+      return;
+    }
+
+    // -- handbook --------------------------------------------------------------
+
+    if (section === "handbook") {
+      if (operation !== "get") {
+        throw usageError(`Unknown mirror handbook subcommand. Try: get <kind>. Known kinds: ${Object.keys(HANDBOOK_KINDS).join(", ")}`);
+      }
+      const kind = positionals[3];
+      if (!kind) throw usageError(`A handbook kind is required. Known kinds: ${Object.keys(HANDBOOK_KINDS).join(", ")}`);
+      const outDirRaw = values.destination;
+      const outDir = outDirRaw ? resolvePathMirror(outDirRaw) : join(defaultMirrorRoot(), "handbook");
+      await mkdir(outDir, { recursive: true });
+      const overwrite = Boolean(values.overwrite);
+      const target = join(outDir, `${kind}.pdf`);
+      if (!overwrite && (await fileExists(target))) {
+        writeSuccess(
+          {
+            command: "mirror handbook get",
+            data: { path: target, skipped: true, reason: "already exists (sustech mirror handbook overwrite)" },
+            text: `  ⏭  ${target} already exists (pass --overwrite)`,
+            summary: { path: target, downloaded: false },
+            meta: { source: "SUSTech CRA mirror" },
+          },
+          output,
+        );
+        return;
+      }
+      const client = new MirrorClient();
+      const bytes = await client.fetchHandbook(kind);
+      await writeFile(target, bytes);
+      writeSuccess(
+        {
+          command: "mirror handbook get",
+          data: { kind, path: target, bytes: bytes.byteLength },
+          text: `  ✅ ${target} (${bytes.byteLength.toLocaleString()} bytes)`,
+          summary: { path: target, downloaded: true, bytes: bytes.byteLength },
+          meta: { source: "SUSTech CRA mirror" },
+        },
+        output,
+      );
+      return;
+    }
+
+    // -- list (directory listing) ----------------------------------------------
+    //
+    // NOTE: mirrors.sustech.edu.cn serves a VuePress SPA on directory GETs —
+    // there is no Nginx autoindex and no JSON listing API. This command
+    // therefore works only when the response happens to contain real anchor
+    // rows; otherwise it points the user at the browsable page.
+
+    if (section === "list") {
+      const subpath = positionals[2];
+      if (!subpath) throw usageError("A subpath is required (e.g. /courses or /courses/syllabus).");
+      const client = new MirrorClient();
+      const html = await client.fetchIndexHtml(subpath);
+      const entries = client
+        .parseIndexEntries(html)
+        .filter((e) => e.href.includes(subpath.replace(/^\/+|\/+$/g, "")) || !e.href.startsWith("/"));
+      if (entries.length === 0) {
+        throw new CliError(
+          `No machine-readable listing for ${subpath} — the mirror serves a web UI (SPA) on directory paths. Browse ${MIRROR_BASE}/${subpath.replace(/^\/+/, "")}/ in a browser instead.`,
+          "MIRROR_LISTING_UNAVAILABLE",
+          1,
+          { subpath, url: `${MIRROR_BASE}/${subpath.replace(/^\/+/, "")}/` },
+        );
+      }
+      writeSuccess(
+        {
+          command: "mirror list",
+          data: { subpath, entries },
+          text: formatIndexEntries(entries),
+          summary: { total: entries.length },
+          meta: { source: "SUSTech CRA mirror" },
+        },
+        output,
+      );
+      return;
+    }
+
+    // -- course (TIS-backed machine-readable course info) ----------------------
+
+    if (section === "course") {
+      const code = normalizeCourseCode(positionals[2] ?? "");
+      if (!code) throw usageError("A course code is required (e.g. CLE022).");
+      let credentials: Credentials | null = null;
+      let credentialError: unknown;
+      try {
+        credentials = await resolvedCredentials(values);
+      } catch (error) {
+        credentialError = error;
+      }
+      if (!credentials) {
+        throw new CliError(
+          `TIS login required for mirror course (grade history / catalog lookup). Run 'sustech auth login' first. Reason: ${credentialError instanceof Error ? credentialError.message : String(credentialError)}`,
+          "MIRROR_COURSE_NO_AUTH",
+          1,
+          { code },
+        );
+      }
+      const tis = new TisClient(new TisSession(credentials));
+      // 1) grade history (courses the user has taken)
+      let record: { grade?: GradeRecord; catalog?: Course } = {};
+      try {
+        const grades = await tis.grades();
+        record.grade = grades.find((g) => g.code.toUpperCase() === code);
+      } catch {
+        // grade lookup is best-effort
+      }
+      // 2) public catalog (courses in the active selection round)
+      if (!record.grade) {
+        try {
+          const semester = parseSemester(undefined);
+          const { courses } = await tis.searchCatalog(semester, { keyword: code, limit: 5 });
+          record.catalog = courses.find((c) => c.code.toUpperCase() === code);
+        } catch {
+          // catalog lookup is best-effort
+      }
+      }
+      const data = toMirrorCourseData(code, record, tis);
+      if (!data) {
+        throw new CliError(
+          `${code} not found in TIS grade history or the catalog. Try 'sustech mirror syllabus exists ${code}' to check the mirror.`,
+          "MIRROR_COURSE_NOT_FOUND",
+          1,
+          { code },
+        );
+      }
+      writeSuccess(
+        {
+          command: "mirror course",
+          data,
+          text: formatMirrorCourse(data),
+          meta: { source: "TIS" },
+        },
+        output,
+      );
+      return;
+    }
+
     throw usageError(
       `Unknown mirror syllabus subcommand. Try one of: url, exists, get, text.`,
     );
@@ -2578,6 +2884,54 @@ async function runOnline(
     // Python port at sustech_survival._cache.config_root().
     const home = process.env.SUSTECH_HOME ?? join(homedir(), ".sustech_survival");
     return join(home, "downloads", "syllabus");
+  }
+
+  function defaultMirrorRoot(): string {
+    // Shared download root for program/map/handbook artifacts:
+    // ~/.sustech_survival/downloads/<kind>/. Mirrors the Python port's
+    // config_root()/"downloads"/<subdir> layout.
+    const home = process.env.SUSTECH_HOME ?? join(homedir(), ".sustech_survival");
+    return join(home, "downloads");
+  }
+
+  /** Map a TIS grade or catalog record onto the mirror-course shape. */
+  function toMirrorCourseData(
+    code: string,
+    record: { grade?: GradeRecord; catalog?: Course },
+    _tis: TisClient,
+  ):
+    | {
+        code: string; name: string; nameEn?: string; department?: string; credits?: number | null;
+        courseType?: string; courseCategory?: string; semester?: string; score?: string;
+        rank?: string; classSize?: string; source: string;
+      }
+    | undefined {
+    if (record.grade) {
+      const g = record.grade;
+      return {
+        code: g.code,
+        name: g.name,
+        nameEn: g.nameEn,
+        department: g.department,
+        credits: g.credits,
+        courseType: g.nature,
+        semester: g.semester,
+        score: g.letterGrade,
+        source: "tis_grades",
+      };
+    }
+    if (record.catalog) {
+      const c = record.catalog;
+      return {
+        code: c.code,
+        name: c.name,
+        credits: c.credits,
+        courseType: c.nature,
+        courseCategory: c.category,
+        source: "tis_catalog",
+      };
+    }
+    return undefined;
   }
 
   async function fileExists(path: string): Promise<boolean> {
